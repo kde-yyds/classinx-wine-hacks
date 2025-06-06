@@ -81,7 +81,7 @@ classinx-wine-hacks/
 - Make sure to disable "Allow the window manager to control the windows" in winecfg.
 
 ## Compatibility
-- **ClassIn X**: Older versions with old UI are recommended because they don't
+- **ClassIn X**: Older versions with old UI are recommended because new ones have issue to write around the toolbox popup.
 
 
 ## License

@@ -2,7 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <map>
+#include <set>
 
 // Structure to hold minimal window information
 struct WindowInfo {
@@ -10,15 +10,17 @@ struct WindowInfo {
     std::string title;
     bool isFullscreen;
     bool isMinimized;
+    bool isSmallSize;  // 160x24 or similar small size
+    RECT rect;
     bool isTargetWindowBottom;  // Fullscreen "ClassIn X" -> send to bottom
     bool isTargetWindowTop;     // Non-fullscreen "ClassIn X" -> send to top
-    bool isTargetWindowHide;    // Minimized "ClassIn X" -> hide completely
+    bool isTargetWindowHide;    // Newly minimized small "ClassIn X" -> hide once
 };
 
 // Global vector to store found windows
 std::vector<WindowInfo> windows;
-// Track all ClassIn X windows we've seen (including hidden ones)
-std::map<HWND, bool> trackedWindows; // HWND -> isCurrentlyHidden
+// Track windows we've already hidden (never hide them again)
+std::set<HWND> alreadyHiddenWindows;
 
 // Function to check if window title matches exactly "ClassIn X"
 bool isExactClassInX(const std::string& title) {
@@ -32,36 +34,13 @@ std::string hwndToString(HWND hwnd) {
     return std::string(buffer);
 }
 
-// Function to check if window is in minimized position (bottom-left corner)
-bool isInMinimizedPosition(const RECT& rect) {
-    // Wine typically places minimized windows at very small coordinates
-    // Usually around (0,0) to (160,30) or similar small rectangle in bottom-left
+// Function to check if window has small minimized size (like 160x24)
+bool isSmallMinimizedSize(const RECT& rect) {
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
 
-    return (rect.left <= 10 && rect.top <= 10 && width <= 200 && height <= 50) ||
-    (rect.left < 0 && rect.top < 0) ||  // Sometimes negative coordinates
-    (width <= 160 && height <= 30 && rect.left <= 200 && rect.top <= 200);
-}
-
-// Function to check if a window still exists and get its state
-bool checkWindowState(HWND hwnd, bool& isVisible, bool& isMinimized, bool& isInMinPos) {
-    if (!IsWindow(hwnd)) {
-        return false; // Window no longer exists
-    }
-
-    isVisible = IsWindowVisible(hwnd);
-
-    LONG style = GetWindowLongA(hwnd, GWL_STYLE);
-    isMinimized = (style & WS_MINIMIZE) != 0;
-
-    RECT rect;
-    isInMinPos = false;
-    if (GetWindowRect(hwnd, &rect)) {
-        isInMinPos = isInMinimizedPosition(rect);
-    }
-
-    return true;
+    // Wine typically makes minimized windows around 160x24 or similar small sizes
+    return (width <= 200 && height <= 50);
 }
 
 // Callback function for EnumWindows
@@ -84,14 +63,8 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
         return TRUE;
     }
 
-    // Add to tracked windows if not already there
-    if (trackedWindows.find(hwnd) == trackedWindows.end()) {
-        trackedWindows[hwnd] = false; // Not hidden initially
-    }
-
     // Get window rectangle
-    RECT rect;
-    if (!GetWindowRect(hwnd, &rect)) {
+    if (!GetWindowRect(hwnd, &info.rect)) {
         return TRUE;
     }
 
@@ -99,38 +72,44 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     LONG style = GetWindowLongA(hwnd, GWL_STYLE);
     info.isMinimized = (style & WS_MINIMIZE) != 0;
 
-    // Check if window is in minimized position (Wine-specific issue)
-    bool inMinimizedPosition = isInMinimizedPosition(rect);
+    // Check if window has small size (160x24 etc.)
+    info.isSmallSize = isSmallMinimizedSize(info.rect);
 
     // Check if window is fullscreen
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    info.isFullscreen = (rect.left <= 0 && rect.top <= 0 &&
-    rect.right >= screenWidth &&
-    rect.bottom >= screenHeight);
+    info.isFullscreen = (info.rect.left <= 0 && info.rect.top <= 0 &&
+    info.rect.right >= screenWidth &&
+    info.rect.bottom >= screenHeight);
 
     // Set target flags based on window state
-    if (info.isMinimized || inMinimizedPosition) {
-        // Minimized or in minimized position -> hide completely
+    if ((info.isMinimized || info.isSmallSize) &&
+        alreadyHiddenWindows.find(hwnd) == alreadyHiddenWindows.end()) {
+        // Minimized or small size AND never hidden before -> hide once
         info.isTargetWindowHide = true;
-        info.isTargetWindowBottom = false;
-        info.isTargetWindowTop = false;
-    } else if (info.isFullscreen) {
-        // Fullscreen -> send to bottom
-        info.isTargetWindowBottom = true;
-        info.isTargetWindowTop = false;
-        info.isTargetWindowHide = false;
-    } else {
-        // Non-fullscreen, non-minimized -> send to top
-        info.isTargetWindowTop = true;
-        info.isTargetWindowBottom = false;
-        info.isTargetWindowHide = false;
-    }
+    info.isTargetWindowBottom = false;
+    info.isTargetWindowTop = false;
+        } else if (info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
+            // Fullscreen and not minimized/small -> send to bottom
+            info.isTargetWindowBottom = true;
+            info.isTargetWindowTop = false;
+            info.isTargetWindowHide = false;
+        } else if (!info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
+            // Non-fullscreen, non-minimized, not small -> send to top
+            info.isTargetWindowTop = true;
+            info.isTargetWindowBottom = false;
+            info.isTargetWindowHide = false;
+        } else {
+            // Already hidden before, or other state -> do nothing
+            info.isTargetWindowTop = false;
+            info.isTargetWindowBottom = false;
+            info.isTargetWindowHide = false;
+        }
 
-    // Add all "ClassIn X" windows
-    windows.push_back(info);
+        // Add all "ClassIn X" windows
+        windows.push_back(info);
 
-    return TRUE;
+        return TRUE;
 }
 
 // Function to set window to bottom
@@ -169,22 +148,32 @@ bool hideWindow(HWND hwnd) {
     return result != 0;
 }
 
-// Function to show window again
-bool showWindow(HWND hwnd) {
-    // Show the window again
-    BOOL result = ShowWindow(hwnd, SW_SHOW);
-    return result != 0;
+// Function to print detailed window info for debugging
+void printWindowDebugInfo(const WindowInfo& win, const std::string& action) {
+    int width = win.rect.right - win.rect.left;
+    int height = win.rect.bottom - win.rect.top;
+
+    std::cout << std::endl;
+    std::cout << "  DEBUG - " << action << ":" << std::endl;
+    std::cout << "    HWND: " << hwndToString(win.hwnd) << std::endl;
+    std::cout << "    Title: \"" << win.title << "\"" << std::endl;
+    std::cout << "    Position: (" << win.rect.left << ", " << win.rect.top << ")" << std::endl;
+    std::cout << "    Size: " << width << "x" << height << std::endl;
+    std::cout << "    Minimized: " << (win.isMinimized ? "YES" : "NO") << std::endl;
+    std::cout << "    SmallSize: " << (win.isSmallSize ? "YES" : "NO") << std::endl;
+    std::cout << "    Fullscreen: " << (win.isFullscreen ? "YES" : "NO") << std::endl;
+    std::cout << "    Already Hidden Before: " << (alreadyHiddenWindows.find(win.hwnd) != alreadyHiddenWindows.end() ? "YES" : "NO") << std::endl;
 }
 
 int main() {
-    std::cout << "ClassIn X Window Manager - Wine Hacks Edition" << std::endl;
-    std::cout << "=============================================" << std::endl;
+    std::cout << "ClassIn X Wine Hacks" << std::endl;
+    std::cout << "==========================================================" << std::endl;
     std::cout << "Fullscreen 'ClassIn X' -> Bottom" << std::endl;
     std::cout << "Non-fullscreen 'ClassIn X' -> TOPMOST" << std::endl;
-    std::cout << "Minimized 'ClassIn X' -> HIDDEN" << std::endl;
+    std::cout << "Minimized/Small 'ClassIn X' -> HIDDEN (once only)" << std::endl;
     std::cout << "Monitoring every 0.5 seconds..." << std::endl;
     std::cout << "Press Ctrl+C to stop" << std::endl;
-    std::cout << "=============================================" << std::endl;
+    std::cout << "==========================================================" << std::endl;
 
     // Check screen resolution
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
@@ -196,72 +185,39 @@ int main() {
     int totalProcessedBottom = 0;
     int totalProcessedTop = 0;
     int totalProcessedHidden = 0;
-    int totalProcessedShown = 0;
 
     while (true) {
         cycles++;
         windows.clear();
 
-        // First, scan for currently visible windows
+        // Scan for currently visible windows
         EnumWindows(EnumWindowsProc, 0);
-
-        // Then, check all tracked windows (including hidden ones)
-        auto it = trackedWindows.begin();
-        while (it != trackedWindows.end()) {
-            HWND hwnd = it->first;
-            bool wasHidden = it->second;
-
-            bool isVisible, isMinimized, isInMinPos;
-            if (!checkWindowState(hwnd, isVisible, isMinimized, isInMinPos)) {
-                // Window no longer exists, remove from tracking
-                it = trackedWindows.erase(it);
-                continue;
-            }
-
-            // Check if hidden window should be shown again
-            if (wasHidden && isVisible && !isMinimized && !isInMinPos) {
-                // Window was hidden but is now visible and not minimized
-                // Don't need to do anything, it will be handled by EnumWindows
-                trackedWindows[hwnd] = false; // Mark as not hidden
-            }
-            // Check if visible window should be hidden
-            else if (!wasHidden && isVisible && (isMinimized || isInMinPos)) {
-                // Window is visible but should be hidden
-                if (hideWindow(hwnd)) {
-                    trackedWindows[hwnd] = true; // Mark as hidden
-                    totalProcessedHidden++;
-                    std::cout << "[" << cycles << "] Hidden tracked window: "
-                    << hwndToString(hwnd) << std::endl;
-                }
-            }
-
-            ++it;
-        }
 
         // Process currently visible windows
         if (!windows.empty()) {
             int processedBottom = 0;
             int processedTop = 0;
             int processedHidden = 0;
+            int ignored = 0;
 
             std::cout << "[" << cycles << "] Found " << windows.size() << " 'ClassIn X' window(s): ";
 
             for (const auto& win : windows) {
                 if (win.isTargetWindowHide) {
-                    // Minimized -> hide completely
+                    // Minimized/small and never hidden before -> hide once
                     if (hideWindow(win.hwnd)) {
                         processedHidden++;
                         totalProcessedHidden++;
-                        trackedWindows[win.hwnd] = true; // Mark as hidden
+                        alreadyHiddenWindows.insert(win.hwnd); // Remember we hid this window
                     }
-                    std::cout << "\"" << win.title << "\"(Min->Hide) ";
+                    std::cout << "\"" << win.title << "\"(FirstHide) ";
+                    printWindowDebugInfo(win, "HIDING: First time minimized/small");
                 } else if (win.isTargetWindowBottom) {
                     // Fullscreen -> send to bottom
                     if (setWindowToBottom(win.hwnd)) {
                         processedBottom++;
                         totalProcessedBottom++;
                     }
-                    trackedWindows[win.hwnd] = false; // Mark as not hidden
                     std::cout << "\"" << win.title << "\"(FS->Bot) ";
                 } else if (win.isTargetWindowTop) {
                     // Non-fullscreen -> send to topmost
@@ -269,24 +225,38 @@ int main() {
                         processedTop++;
                         totalProcessedTop++;
                     }
-                    trackedWindows[win.hwnd] = false; // Mark as not hidden
                     std::cout << "\"" << win.title << "\"(Win->TopMost) ";
+                } else {
+                    // Ignored (already hidden before, or other state)
+                    ignored++;
+                    bool wasHiddenBefore = alreadyHiddenWindows.find(win.hwnd) != alreadyHiddenWindows.end();
+                    if (wasHiddenBefore) {
+                        std::cout << "\"" << win.title << "\"(AlreadyHidden) ";
+                    } else {
+                        std::cout << "\"" << win.title << "\"(OtherState) ";
+                        printWindowDebugInfo(win, "IGNORING: Other state");
+                    }
                 }
             }
 
             if (processedBottom > 0 || processedTop > 0 || processedHidden > 0) {
                 std::cout << "-> " << processedBottom << " to bottom, "
                 << processedTop << " to topmost, "
-                << processedHidden << " hidden" << std::endl;
+                << processedHidden << " hidden";
+                if (ignored > 0) {
+                    std::cout << ", " << ignored << " ignored";
+                }
+                std::cout << std::endl;
             } else {
                 std::cout << "-> failed to process" << std::endl;
             }
         } else if (cycles % 20 == 0) {
             // Print status every 10 seconds (20 cycles * 0.5s) to show it's still running
-            std::cout << "[" << cycles << "] Monitoring... (Tracked: " << trackedWindows.size()
-            << ", Total: " << totalProcessedBottom << " to bottom, "
+            std::cout << "[" << cycles << "] Monitoring... (Total: "
+            << totalProcessedBottom << " to bottom, "
             << totalProcessedTop << " to topmost, "
-            << totalProcessedHidden << " hidden)" << std::endl;
+            << totalProcessedHidden << " hidden, "
+            << alreadyHiddenWindows.size() << " in hide-once list)" << std::endl;
         }
 
         Sleep(500); // Wait 0.5 seconds

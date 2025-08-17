@@ -12,19 +12,22 @@ struct WindowInfo {
     bool isMinimized;
     bool isSmallSize;  // 160x24 or similar small size
     RECT rect;
-    bool isTargetWindowBottom;  // Fullscreen "ClassIn X" -> send to bottom
-    bool isTargetWindowTop;     // Non-fullscreen "ClassIn X" -> send to top
-    bool isTargetWindowHide;    // Newly minimized small "ClassIn X" -> hide once
+    bool isTargetWindowBottom;  // Fullscreen "ClassIn X" or "Classroom*" -> send to bottom
+    bool isTargetWindowTop;     // Non-fullscreen "ClassIn X" or "Classroom*" -> send to top
+    bool isTargetWindowHide;    // Minimized small "ClassIn X" or "Classroom*" -> hide (every loop)
+    bool isTargetWindowRestore; // Was previously hidden by move, but now should be restored
 };
 
 // Global vector to store found windows
 std::vector<WindowInfo> windows;
-// Track windows we've already hidden (never hide them again)
-std::set<HWND> alreadyHiddenWindows;
 
-// Function to check if window title matches exactly "ClassIn X"
-bool isExactClassInX(const std::string& title) {
-    return title == "ClassIn X";
+// Track windows that we've moved away, so we can restore them
+std::set<HWND> movedWindows;
+
+// Function to check if window title matches "ClassIn X" or starts with "Classroom"
+bool isExactClassInXOrClassroom(const std::string& title) {
+    // Match "ClassIn X" or any title starting with "Classroom"
+    return title == "ClassIn X" || title.rfind("Classroom", 0) == 0;
 }
 
 // Debug function to convert HWND to string
@@ -59,7 +62,7 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     info.title = title;
 
     // Skip if title doesn't match
-    if (!isExactClassInX(info.title)) {
+    if (!isExactClassInXOrClassroom(info.title)) {
         return TRUE;
     }
 
@@ -83,33 +86,42 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     info.rect.bottom >= screenHeight);
 
     // Set target flags based on window state
-    if ((info.isMinimized || info.isSmallSize) &&
-        alreadyHiddenWindows.find(hwnd) == alreadyHiddenWindows.end()) {
-        // Minimized or small size AND never hidden before -> hide once
+    if ((info.isMinimized || info.isSmallSize)) {
+        // Minimized or small size -> always hide (move out), every loop
         info.isTargetWindowHide = true;
-    info.isTargetWindowBottom = false;
-    info.isTargetWindowTop = false;
-        } else if (info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
-            // Fullscreen and not minimized/small -> send to bottom
-            info.isTargetWindowBottom = true;
-            info.isTargetWindowTop = false;
-            info.isTargetWindowHide = false;
-        } else if (!info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
-            // Non-fullscreen, non-minimized, not small -> send to top
-            info.isTargetWindowTop = true;
-            info.isTargetWindowBottom = false;
-            info.isTargetWindowHide = false;
-        } else {
-            // Already hidden before, or other state -> do nothing
-            info.isTargetWindowTop = false;
-            info.isTargetWindowBottom = false;
-            info.isTargetWindowHide = false;
-        }
+        info.isTargetWindowBottom = false;
+        info.isTargetWindowTop = false;
+        info.isTargetWindowRestore = false;
+    } else if (!info.isMinimized && !info.isSmallSize && movedWindows.find(hwnd) != movedWindows.end()) {
+        // Previously hidden (by moving), now unminimized and moved? Restore
+        info.isTargetWindowRestore = true;
+        info.isTargetWindowHide = false;
+        info.isTargetWindowBottom = false;
+        info.isTargetWindowTop = false;
+    } else if (info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
+        // Fullscreen and not minimized/small -> send to bottom
+        info.isTargetWindowBottom = true;
+        info.isTargetWindowTop = false;
+        info.isTargetWindowHide = false;
+        info.isTargetWindowRestore = false;
+    } else if (!info.isFullscreen && !info.isMinimized && !info.isSmallSize) {
+        // Non-fullscreen, non-minimized, not small -> send to top
+        info.isTargetWindowTop = true;
+        info.isTargetWindowBottom = false;
+        info.isTargetWindowHide = false;
+        info.isTargetWindowRestore = false;
+    } else {
+        // Other state
+        info.isTargetWindowTop = false;
+        info.isTargetWindowBottom = false;
+        info.isTargetWindowHide = false;
+        info.isTargetWindowRestore = false;
+    }
 
-        // Add all "ClassIn X" windows
-        windows.push_back(info);
+    // Add all matching windows
+    windows.push_back(info);
 
-        return TRUE;
+    return TRUE;
 }
 
 // Function to set window to bottom
@@ -141,10 +153,26 @@ bool setWindowToTop(HWND hwnd) {
     return result1 || result2;
 }
 
-// Function to hide window completely
-bool hideWindow(HWND hwnd) {
-    // Hide the window completely
-    BOOL result = ShowWindow(hwnd, SW_HIDE);
+// Function to "hide" window by moving it far out (9999,9999)
+bool moveWindowFar(HWND hwnd) {
+    // Move window to a far away location (9999,9999)
+    BOOL result = SetWindowPos(hwnd, HWND_TOP, 9999, 9999, 200, 50,
+                               SWP_NOACTIVATE | SWP_NOZORDER);
+    if (result) {
+        movedWindows.insert(hwnd);
+    }
+    return result != 0;
+}
+
+// Function to restore window to visible (move to 0,0, size unchanged)
+bool restoreWindow(HWND hwnd, const RECT& origRect) {
+    int width = origRect.right - origRect.left;
+    int height = origRect.bottom - origRect.top;
+    BOOL result = SetWindowPos(hwnd, HWND_TOP, 0, 0, width, height,
+                               SWP_NOACTIVATE | SWP_NOZORDER);
+    if (result) {
+        movedWindows.erase(hwnd);
+    }
     return result != 0;
 }
 
@@ -162,15 +190,16 @@ void printWindowDebugInfo(const WindowInfo& win, const std::string& action) {
     std::cout << "    Minimized: " << (win.isMinimized ? "YES" : "NO") << std::endl;
     std::cout << "    SmallSize: " << (win.isSmallSize ? "YES" : "NO") << std::endl;
     std::cout << "    Fullscreen: " << (win.isFullscreen ? "YES" : "NO") << std::endl;
-    std::cout << "    Already Hidden Before: " << (alreadyHiddenWindows.find(win.hwnd) != alreadyHiddenWindows.end() ? "YES" : "NO") << std::endl;
+    std::cout << "    Marked as moved: " << (movedWindows.find(win.hwnd) != movedWindows.end() ? "YES" : "NO") << std::endl;
 }
 
 int main() {
-    std::cout << "ClassIn X Wine Hacks" << std::endl;
+    std::cout << "ClassIn X/Room Wine Hacks" << std::endl;
     std::cout << "==========================================================" << std::endl;
-    std::cout << "Fullscreen 'ClassIn X' -> Bottom" << std::endl;
-    std::cout << "Non-fullscreen 'ClassIn X' -> TOPMOST" << std::endl;
-    std::cout << "Minimized/Small 'ClassIn X' -> HIDDEN (once only)" << std::endl;
+    std::cout << "Fullscreen 'ClassIn X'/'Classroom*' -> Bottom" << std::endl;
+    std::cout << "Non-fullscreen 'ClassIn X'/'Classroom*' -> TOPMOST" << std::endl;
+    std::cout << "Minimized/Small 'ClassIn X'/'Classroom*' -> MOVE FAR (9999,9999) always" << std::endl;
+    std::cout << "Restore unmoved when not minimized/small" << std::endl;
     std::cout << "Monitoring every 0.5 seconds..." << std::endl;
     std::cout << "Press Ctrl+C to stop" << std::endl;
     std::cout << "==========================================================" << std::endl;
@@ -184,7 +213,8 @@ int main() {
     int cycles = 0;
     int totalProcessedBottom = 0;
     int totalProcessedTop = 0;
-    int totalProcessedHidden = 0;
+    int totalProcessedMoved = 0;
+    int totalProcessedRestored = 0;
 
     while (true) {
         cycles++;
@@ -197,21 +227,29 @@ int main() {
         if (!windows.empty()) {
             int processedBottom = 0;
             int processedTop = 0;
-            int processedHidden = 0;
+            int processedMoved = 0;
+            int processedRestored = 0;
             int ignored = 0;
 
-            std::cout << "[" << cycles << "] Found " << windows.size() << " 'ClassIn X' window(s): ";
+            std::cout << "[" << cycles << "] Found " << windows.size() << " 'ClassIn X'/'Classroom*' window(s): ";
 
             for (const auto& win : windows) {
                 if (win.isTargetWindowHide) {
-                    // Minimized/small and never hidden before -> hide once
-                    if (hideWindow(win.hwnd)) {
-                        processedHidden++;
-                        totalProcessedHidden++;
-                        alreadyHiddenWindows.insert(win.hwnd); // Remember we hid this window
+                    // Minimized/small -> move far (every time)
+                    if (moveWindowFar(win.hwnd)) {
+                        processedMoved++;
+                        totalProcessedMoved++;
                     }
-                    std::cout << "\"" << win.title << "\"(FirstHide) ";
-                    printWindowDebugInfo(win, "HIDING: First time minimized/small");
+                    std::cout << "\"" << win.title << "\"(MovedFar) ";
+                    printWindowDebugInfo(win, "MOVING FAR: Minimized/small");
+                } else if (win.isTargetWindowRestore) {
+                    // Previously moved out, but now normal -> restore to (0,0)
+                    if (restoreWindow(win.hwnd, win.rect)) {
+                        processedRestored++;
+                        totalProcessedRestored++;
+                    }
+                    std::cout << "\"" << win.title << "\"(Restored) ";
+                    printWindowDebugInfo(win, "RESTORING: Unminimized/normal");
                 } else if (win.isTargetWindowBottom) {
                     // Fullscreen -> send to bottom
                     if (setWindowToBottom(win.hwnd)) {
@@ -227,22 +265,18 @@ int main() {
                     }
                     std::cout << "\"" << win.title << "\"(Win->TopMost) ";
                 } else {
-                    // Ignored (already hidden before, or other state)
+                    // Ignored (other state)
                     ignored++;
-                    bool wasHiddenBefore = alreadyHiddenWindows.find(win.hwnd) != alreadyHiddenWindows.end();
-                    if (wasHiddenBefore) {
-                        std::cout << "\"" << win.title << "\"(AlreadyHidden) ";
-                    } else {
-                        std::cout << "\"" << win.title << "\"(OtherState) ";
-                        printWindowDebugInfo(win, "IGNORING: Other state");
-                    }
+                    std::cout << "\"" << win.title << "\"(OtherState) ";
+                    printWindowDebugInfo(win, "IGNORING: Other state");
                 }
             }
 
-            if (processedBottom > 0 || processedTop > 0 || processedHidden > 0) {
+            if (processedBottom > 0 || processedTop > 0 || processedMoved > 0 || processedRestored > 0) {
                 std::cout << "-> " << processedBottom << " to bottom, "
                 << processedTop << " to topmost, "
-                << processedHidden << " hidden";
+                << processedMoved << " moved far, "
+                << processedRestored << " restored";
                 if (ignored > 0) {
                     std::cout << ", " << ignored << " ignored";
                 }
@@ -255,8 +289,9 @@ int main() {
             std::cout << "[" << cycles << "] Monitoring... (Total: "
             << totalProcessedBottom << " to bottom, "
             << totalProcessedTop << " to topmost, "
-            << totalProcessedHidden << " hidden, "
-            << alreadyHiddenWindows.size() << " in hide-once list)" << std::endl;
+            << totalProcessedMoved << " moved far, "
+            << totalProcessedRestored << " restored, "
+            << movedWindows.size() << " in moved set)" << std::endl;
         }
 
         Sleep(500); // Wait 0.5 seconds
